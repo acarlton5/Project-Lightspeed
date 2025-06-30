@@ -1,0 +1,160 @@
+// This is a fully commented copy of `ftl_codec.rs` used for reference.
+// The codec handles parsing of the FTL (Fast Transport Layer) handshake
+// protocol used when OBS connects to this server. These comments explain
+// each section of the code so it can be adapted for supporting multiple
+// streamers identified by a stream key and session.
+
+use bytes::{Buf, BufMut, BytesMut};
+
+use std::collections::HashMap;
+use std::{fmt, io};
+use tokio_util::codec::{Decoder, Encoder};
+
+// `FtlCommand` enumerates all possible commands we expect to receive from
+// the client during the handshake.
+#[derive(Debug)]
+pub enum FtlCommand {
+    // Client is providing an HMAC for authentication.
+    HMAC,
+    // Client requests to connect. Additional data such as channel id and
+    // stream key is included.
+    Connect { data: HashMap<String, String> },
+    // Keep-alive ping message.
+    Ping,
+    // Single '.' line used to signal the end of a command block.
+    Dot,
+    // Key/value pair attributes sent after CONNECT.
+    Attribute { data: HashMap<String, String> },
+    // Sent when the client disconnects.
+    Disconnect,
+}
+
+// `FtlCodec` implements a simple line based codec over TCP. It buffers
+// incoming bytes until a CRLF CRLF sequence is read, then interprets the
+// command.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct FtlCodec {
+    // Temporary buffer for collecting bytes until a full command is read.
+    command_buffer: std::vec::Vec<u8>,
+}
+
+impl FtlCodec {
+    // Construct a new codec with an empty buffer.
+    pub fn new() -> FtlCodec {
+        FtlCodec {
+            command_buffer: Vec::new(),
+        }
+    }
+
+    // Reset the internal buffer when a command has been processed.
+    pub fn reset(&mut self) {
+        self.command_buffer = Vec::new();
+    }
+}
+
+// Implement Tokio's `Decoder` trait so this codec can be used with
+// `Framed` connections.
+impl Decoder for FtlCodec {
+    // Items produced by the decoder are `FtlCommand` values.
+    type Item = FtlCommand;
+    type Error = FtlError;
+
+    // Attempt to decode a command from the provided buffer.
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<FtlCommand>, FtlError> {
+        let command: String;
+        // Data we might extract from the command line.
+        let mut data: HashMap<String, String> = HashMap::new();
+        // Look for the CRLF CRLF sequence that terminates a command.
+        match buf.windows(4).position(|window| window == b"\r\n\r\n") {
+            Some(index) => {
+                // Pull the line out of the buffer and advance past it.
+                command = String::from_utf8_lossy(&buf[..index]).to_string();
+                buf.advance(index + 4);
+                // Determine which command was sent based on the text.
+                if command.as_str().contains("HMAC") {
+                    self.reset();
+                    Ok(Some(FtlCommand::HMAC))
+                } else if command.as_str().contains("DISCONNECT") {
+                    self.reset();
+                    Ok(Some(FtlCommand::Disconnect))
+                } else if command.as_str().contains("CONNECT") {
+                    // CONNECT commands carry parameters separated by spaces:
+                    // "CONNECT <channel_id> ?<stream_key>".
+                    let commands: Vec<&str> = command.split(' ').collect();
+                    let mut key = commands[2].to_string();
+                    // The stream key is prefixed with '?' which we remove.
+                    key.remove(0);
+                    data.insert("channel_id".to_string(), commands[1].to_string());
+                    data.insert("stream_key".to_string(), key);
+                    self.reset();
+                    Ok(Some(FtlCommand::Connect { data }))
+                } else if command.as_str().contains(':') {
+                    // Attribute lines have the form "key: value".
+                    let commands: Vec<&str> = command.split(':').collect();
+                    data.insert("key".to_string(), commands[0].to_string());
+                    data.insert("value".to_string(), commands[1].trim().to_string());
+                    self.reset();
+                    Ok(Some(FtlCommand::Attribute { data }))
+                } else if command.as_str().contains('.') && command.len() == 1 {
+                    // A single dot on a line signifies the end of an attribute list.
+                    self.reset();
+                    Ok(Some(FtlCommand::Dot))
+                } else if command.as_str().contains("PING") {
+                    // Keep-alive ping from the client.
+                    self.reset();
+                    Ok(Some(FtlCommand::Ping))
+                } else {
+                    // Unknown command.
+                    self.reset();
+                    Err(FtlError::Unsupported(command))
+                }
+            }
+            // Not enough bytes yet; wait for more data.
+            None => Ok(None),
+        }
+    }
+}
+
+// Implement the complementary `Encoder` trait so commands can be sent
+// back to the client if needed.
+impl<T> Encoder<T> for FtlCodec
+where
+    T: AsRef<str>,
+{
+    type Error = FtlError;
+
+    fn encode(&mut self, line: T, buf: &mut BytesMut) -> Result<(), FtlError> {
+        let line = line.as_ref();
+        buf.reserve(line.len());
+        buf.put(line.as_bytes());
+        Ok(())
+    }
+}
+
+// Custom error type used by the codec.
+#[derive(Debug)]
+pub enum FtlError {
+    // Unsupported or unknown command string.
+    Unsupported(String),
+    // Underlying I/O error.
+    Io(io::Error),
+}
+
+impl fmt::Display for FtlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FtlError::Io(e) => write!(f, "{}", e),
+            FtlError::Unsupported(s) => {
+                write!(f, "Unsupported FTL Command {}! Bug GRVY to support this", s)
+            }
+        }
+    }
+}
+
+impl From<io::Error> for FtlError {
+    fn from(e: io::Error) -> FtlError {
+        FtlError::Io(e)
+    }
+}
+
+impl std::error::Error for FtlError {}
